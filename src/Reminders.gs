@@ -109,8 +109,34 @@ function parseExtraDays_(value) {
 }
 
 /**
+ * "עד (ימים לפני)" — רוחב סדרת התזכורות היומיות.
+ * מחזיר null אם הריק או לא תקין, אחרת מספר שלם 0..365
+ * (0 = רק יום האירוע). ההבחנה בין "ריק" ל"לא תקין" נבדקת
+ * בשורה עצמה — ראו validateReminderRow_.
+ */
+function parseUntilDays_(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value === 'number') {
+    if (!isFinite(value) || Math.floor(value) !== value) {
+      return null;
+    }
+    return (value >= 0 && value <= 365) ? value : null;
+  }
+  var text = String(value).trim();
+  if (!/^\d{1,3}$/.test(text)) {
+    return null;
+  }
+  var days = parseInt(text, 10);
+  return days <= 365 ? days : null;
+}
+
+/**
  * רשימת כל ההיסטים (בימים לפני האירוע) לשורה, ממוינת, בלי כפילויות.
  * 0 = ביום האירוע.
+ * סדרה "עד" תורמת את כל הימים 0..N — כך שסימונים וסדרה מתמזגים
+ * לרשימה אחת, ויום משותף לא נשלח פעמיים.
  */
 function reminderOffsets_(row) {
   var offsets = [];
@@ -131,8 +157,19 @@ function reminderOffsets_(row) {
   for (var i = 0; i < extra.length; i++) {
     add(extra[i]);
   }
+  var until = parseUntilDays_(row ? row.untilDays : null);
+  if (until !== null) {
+    for (var d = 0; d <= until; d++) {
+      add(d);
+    }
+  }
   offsets.sort(function (a, b) { return a - b; });
   return offsets;
+}
+
+/** תווית ליום בתוך סדרה "עד": "יומי · 7 מתוך 49". */
+function untilSeriesLabel_(dayNumber, totalDays) {
+  return 'יומי · ' + dayNumber + ' מתוך ' + totalDays;
 }
 
 /** תווית אנושית לתזכורת: "ביום האירוע" / "שבוע לפני" / "30 ימים לפני". */
@@ -196,6 +233,11 @@ function validateReminderRow_(row) {
   if (!row.active) {
     return { ok: false, errors: ['השורה מסומנת כלא פעילה'] };
   }
+  var untilRaw = row.untilDays;
+  if (untilRaw !== null && untilRaw !== undefined && String(untilRaw).trim() !== '' &&
+      parseUntilDays_(untilRaw) === null) {
+    errors.push('ערך "עד (ימים לפני)" לא תקין: "' + untilRaw + '" (צריך מספר בין 0 ל-365)');
+  }
   if (!reminderOffsets_(row).length) {
     errors.push('לא סומנה אף תזכורת (אותו יום / שבוע לפני / שבועיים לפני / ימים נוספים)');
   }
@@ -241,6 +283,7 @@ function reminderCandidates_(row, settings, nowMs) {
   }
   var time = normalizeTimeOfDay_(row.timeRaw) || normalizeTimeOfDay_(s.sendTime) ||
              normalizeTimeOfDay_(REMINDER_DEFAULT_SETTINGS.sendTime);
+  var until = parseUntilDays_(row.untilDays);
   var nowHebrewYear = hdHebrewDateOf_(new Date(nowMs)).year;
   var items = [];
   for (var yi = 0; yi < 2; yi++) {
@@ -254,10 +297,15 @@ function reminderCandidates_(row, settings, nowMs) {
       var sendAbs = occurrence.abs - offset;
       var g = hdAbsToGreg_(sendAbs);
       var sendAtMs = new Date(g.year, g.month - 1, g.day, time.hours, time.minutes, 0, 0).getTime();
+      // יום בתוך סדרה "עד" (כולל יום האירוע עצמו): יש לו מונה משלו.
+      var inSeries = until !== null && offset <= until;
+      var dayNumber = inSeries ? (until - offset + 1) : null;
       items.push({
         key: reminderKey_(row.id, year, offset, occurrence.abs),
         offset: offset,
-        label: reminderLabel_(offset),
+        label: inSeries ? untilSeriesLabel_(dayNumber, until + 1) : reminderLabel_(offset),
+        dayNumber: dayNumber,
+        totalDays: inSeries ? (until + 1) : null,
         sendAtMs: sendAtMs,
         eventAbs: occurrence.abs,
         eventHebrewDate: hdFormatHebrewDate_(year, occurrence.month, occurrence.day),
@@ -374,23 +422,33 @@ function buildReminderEmail_(row, item, settings) {
     ? 'התאריך המקורי (' + parseInt(row.day, 10) + ' בחודש) לא קיים בשנה זו, ולכן התזכורת מחושבת ליום האחרון בחודש.'
     : '';
 
+  var seriesValue = item.dayNumber
+    ? 'יום ' + item.dayNumber + ' מתוך ' + item.totalDays
+    : '';
+
   var rows = [
-    ['נושא', topic],
-    ['תאריך עברי', item.eventHebrewDate],
-    ['תאריך לועזי', item.eventIso],
-    ['מתי', reminderDistanceText_(item.offset) + ' (' + item.label + ')']
+    ['נושא', topic]
   ];
+  if (seriesValue) {
+    rows.push(['בסדרה', seriesValue]);
+  }
+  rows.push(['תאריך עברי', item.eventHebrewDate]);
+  rows.push(['תאריך לועזי', item.eventIso]);
+  rows.push(['מתי', reminderDistanceText_(item.offset) + ' (' + item.label + ')']);
   if (notes) {
     rows.push(['הערות', notes]);
   }
 
   var plainLines = [
     'תזכורת: ' + topic,
-    '',
-    'תאריך עברי: ' + item.eventHebrewDate,
-    'תאריך לועזי: ' + item.eventIso,
-    'מתי: ' + reminderDistanceText_(item.offset) + ' (' + item.label + ')'
+    ''
   ];
+  if (seriesValue) {
+    plainLines.push('בסדרה: ' + seriesValue);
+  }
+  plainLines.push('תאריך עברי: ' + item.eventHebrewDate);
+  plainLines.push('תאריך לועזי: ' + item.eventIso);
+  plainLines.push('מתי: ' + reminderDistanceText_(item.offset) + ' (' + item.label + ')');
   if (notes) {
     plainLines.push('הערות: ' + notes);
   }

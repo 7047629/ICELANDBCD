@@ -76,6 +76,7 @@ const {
   normalizeTimeOfDay_,
   normalizeTimeString_,
   parseExtraDays_,
+  parseUntilDays_,
   reminderOffsets_,
   reminderLabel_,
   reminderCandidates_,
@@ -97,9 +98,14 @@ const settings = Object.assign({}, REMINDER_DEFAULT_SETTINGS, {
 
 /* ------------------------- 1. המרות תאריכים ---------------------------- */
 
-check('TZ is Asia/Jerusalem (tests must run there)', () => {
-  ok(process.env.TZ === 'Asia/Jerusalem',
-    'run with TZ=Asia/Jerusalem so send-time math matches Apps Script');
+check('effective timezone is Asia/Jerusalem (tests must run there)', () => {
+  // בודקים את אזור הזמן בפועל, לא את משתנה הסביבה: ב-Windows Node 24 לא
+  // חושף ולא מכבד את TZ, ולכן אזור הזמן של המערכת הוא שקובע את חישובי התאריך.
+  // ב-Linux/macOS ערך TZ=Asia/Jerusalem מופיע כאן בדיוק כמו קודם.
+  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  ok(zone === 'Asia/Jerusalem',
+    'run with TZ=Asia/Jerusalem (or on a machine in that zone) so send-time math ' +
+    'matches Apps Script; effective zone is ' + zone);
 });
 
 check('hebrew -> gregorian matches reference calendar (' + fixtures.dates.length + ' dates)', () => {
@@ -235,6 +241,28 @@ check('offsets union of flags and extra days', () => {
   eq(reminderLabel_(30), '30 ימים לפני');
 });
 
+check('until column parsing (0..365, empty vs invalid)', () => {
+  eq(parseUntilDays_(49), 49);
+  eq(parseUntilDays_('48'), 48);
+  eq(parseUntilDays_(0), 0, '0 = only the event day');
+  eq(parseUntilDays_(365), 365, 'at the cap');
+  eq(parseUntilDays_(''), null, 'empty means no series');
+  eq(parseUntilDays_(null), null);
+  eq(parseUntilDays_(undefined), null);
+  eq(parseUntilDays_(400), null, 'over the cap');
+  eq(parseUntilDays_(12.5), null, 'not an integer');
+  eq(parseUntilDays_('49 ימים'), null, 'free text is not a number');
+});
+
+check('until series merges with flags and extra days without duplicates', () => {
+  const row = { sameDay: true, week: true, twoWeeks: false, extraDays: '60', untilDays: 3 };
+  eq(reminderOffsets_(row), [0, 1, 2, 3, 7, 60], 'flags + extras + 0..3, union sorted');
+  eq(reminderOffsets_(Object.assign({}, row, { untilDays: '' })), [0, 7, 60],
+    'empty column changes nothing');
+  eq(reminderOffsets_(Object.assign({}, row, { untilDays: 'abc' })), [0, 7, 60],
+    'invalid column behaves as empty (validation reports it separately)');
+});
+
 /* --------------------------- 5. תזמון ותזכורות -------------------------- */
 
 const sampleRow = {
@@ -315,6 +343,85 @@ check('per-row time overrides the global send time', () => {
   const item = candidates.filter(c => c.offset === 0 && c.sendAtMs > new Date(2027, 0, 1).getTime())[0];
   const send = new Date(item.sendAtMs);
   eq([send.getHours(), send.getMinutes()], [19, 30]);
+});
+
+/* --------------------- 5b. סדרה יומית ("עד") ----------------------- */
+
+const omerRow = Object.assign({}, sampleRow, {
+  sameDay: false, week: false, twoWeeks: false, extraDays: '', untilDays: 48
+});
+
+check('until series: N=48 gives 49 daily reminders, one per calendar day', () => {
+  const now = new Date(2027, 0, 1).getTime();
+  const year = hdHebrewDateOf_(new Date(now)).year;
+  const mine = reminderCandidates_(omerRow, settings, now).filter(c => c.hebrewYear === year);
+  eq(mine.length, 49, 'N days before + the day itself');
+  const byOffset = {};
+  for (const c of mine) byOffset[c.offset] = c;
+  eq(byOffset[48].dayNumber, 1, 'the farthest day is day 1');
+  eq(byOffset[48].totalDays, 49);
+  eq(byOffset[48].label, 'יומי · 1 מתוך 49');
+  eq(byOffset[0].dayNumber, 49, 'the event day is the last day of the series');
+  eq(byOffset[0].label, 'יומי · 49 מתוך 49');
+
+  const dayAbs = c => {
+    const d = new Date(c.sendAtMs);
+    return hdGregToAbs_(d.getFullYear(), d.getMonth() + 1, d.getDate());
+  };
+  const sorted = mine.slice().sort((a, b) => a.sendAtMs - b.sendAtMs);
+  for (let i = 1; i < sorted.length; i++) {
+    eq(dayAbs(sorted[i]) - dayAbs(sorted[i - 1]), 1, 'consecutive calendar days (DST-safe)');
+  }
+  eq(dayAbs(sorted[0]) + 48, dayAbs(sorted[sorted.length - 1]),
+    'the series starts exactly 48 days before the event day');
+  const keys = mine.map(c => c.key);
+  eq(keys.length, new Set(keys).size, 'every day has its own key');
+});
+
+check('until series merges with checked flags: one email per day, series label wins', () => {
+  const now = new Date(2027, 0, 1).getTime();
+  const year = hdHebrewDateOf_(new Date(now)).year;
+  const row = Object.assign({}, sampleRow, { untilDays: 20 }); // sameDay + week stay checked
+  const mine = reminderCandidates_(row, settings, now).filter(c => c.hebrewYear === year);
+  eq(mine.length, 21, 'offsets 0..20 once each');
+  const seven = mine.filter(c => c.offset === 7);
+  eq(seven.length, 1, 'offset 7 appears once even though "שבוע לפני" is checked');
+  eq(seven[0].label, 'יומי · 14 מתוך 21', 'dayNumber = 20 - 7 + 1');
+  const keys = mine.map(c => c.key);
+  eq(keys.length, new Set(keys).size, 'no duplicate keys');
+});
+
+check('until series: the grace window applies per day', () => {
+  const now = new Date(2027, 0, 1).getTime();
+  const future = reminderCandidates_(omerRow, settings, now)
+    .filter(c => c.sendAtMs > now)
+    .sort((a, b) => a.sendAtMs - b.sendAtMs);
+  ok(future.length > 0, 'has future candidates');
+  const first = future[0];
+  eq(dueReminders_(omerRow, settings, first.sendAtMs - 60000, {}).length, 0, 'not due a minute early');
+  eq(dueReminders_(omerRow, settings, first.sendAtMs + 60000, {}).length, 1, 'due right after send time');
+  eq(dueReminders_(omerRow, settings, first.sendAtMs + 13 * 3600000, {}).length, 0,
+    'a day older than grace 12h is dropped, not caught up');
+  const sent = {};
+  sent[first.key] = true;
+  eq(dueReminders_(omerRow, settings, first.sendAtMs + 60000, sent).length, 0,
+    'the key prevents a resend');
+});
+
+check('until series: validation accepts a series-only row and reports bad values', () => {
+  const seriesOnly = Object.assign({}, sampleRow, {
+    sameDay: false, week: false, twoWeeks: false, extraDays: '', untilDays: 5
+  });
+  eq(validateReminderRow_(seriesOnly).ok, true, 'a series alone is a valid reminder');
+
+  const tooBig = validateReminderRow_(Object.assign({}, seriesOnly, { untilDays: '400' }));
+  eq(tooBig.ok, false, 'out of range fails');
+  eq(tooBig.errors.some(e => e.indexOf('עד (ימים לפני)') >= 0), true, 'the error names the column');
+
+  eq(validateReminderRow_(Object.assign({}, seriesOnly, { untilDays: 'abc' })).ok, false,
+    'free text fails');
+  eq(validateReminderRow_(Object.assign({}, seriesOnly, { untilDays: '' })).ok, false,
+    'removing the series from a flagless row leaves nothing to send');
 });
 
 check('summer time: 08:00 in Israel is UTC+3 during DST', () => {
@@ -408,6 +515,26 @@ check('html escaping', () => {
   ok(email.html.indexOf('<b>שם</b>') < 0, 'no raw html injection');
 });
 
+check('until series email: counter plus the event date, plain and html', () => {
+  const now = new Date(2027, 0, 1).getTime();
+  const item = reminderCandidates_(omerRow, settings, now)
+    .filter(c => c.offset === 3 && c.sendAtMs > now)[0];
+  ok(item, 'candidate found');
+  eq(item.dayNumber, 46, '48 - 3 + 1');
+  eq(item.totalDays, 49);
+  const email = buildReminderEmail_(omerRow, item, settings);
+  ok(email.subject.indexOf('יומי · 46 מתוך 49') >= 0, 'subject carries the counter');
+  ok(email.plain.indexOf('בסדרה: יום 46 מתוך 49') > 0, 'plain has the counter line');
+  ok(email.html.indexOf('יום 46 מתוך 49') > 0, 'html has the counter');
+  ok(email.plain.indexOf(item.eventIso) > 0, 'plain still has the event date');
+  ok(email.html.indexOf(item.eventHebrewDate) > 0, 'html still has the hebrew event date');
+
+  const normal = reminderCandidates_(sampleRow, settings, now)
+    .filter(c => c.offset === 7 && c.sendAtMs > now)[0];
+  const normalEmail = buildReminderEmail_(sampleRow, normal, settings);
+  ok(normalEmail.plain.indexOf('בסדרה') < 0, 'a normal reminder has no counter line');
+});
+
 /* ------------------------ 8. שכבת הגיליון (mock) ----------------------- */
 
 function fakeSheet(allValues) {
@@ -431,12 +558,13 @@ check('Code.gs loads and exposes the documented entry points', () => {
 
 check('readReminderRows_ maps columns, skips blank rows and defaults active=true', () => {
   const headers = context.MAIN_HEADERS;
+  eq(headers.length, 15, 'A-L inputs + M-N computed + O until');
   const rows = [
     headers,
-    ['', 'יום הולדת', 15, 'כסלו', true, false, true, '30', '', '', '', '', '', ''],
-    ['', '', '', '', '', '', '', '', '', '', '', '', '', ''],
+    ['', 'יום הולדת', 15, 'כסלו', true, false, true, '30', '', '', '', '', '', '', 49],
+    ['', '', '', '', '', '', '', '', '', '', '', '', '', '', ''],
     ['R2-x', 'אזכרה', 3, 'תשרי', true, true, false, '', new Date(2027, 0, 1, 19, 30),
-      'a@b.co', false, 'הערה', '', '']
+      'a@b.co', false, 'הערה', '', '', '']
   ];
   const parsed = context.readReminderRows_(fakeSheet(rows));
   eq(parsed.length, 2, 'blank row skipped');
@@ -444,6 +572,8 @@ check('readReminderRows_ maps columns, skips blank rows and defaults active=true
   eq(parsed[0].topic, 'יום הולדת');
   eq(parsed[0].active, true, 'empty active cell means active');
   eq(parsed[0].extraDays, '30');
+  eq(parsed[0].untilDays, 49, 'until column mapped from O');
+  eq(parsed[1].untilDays, '', 'missing cell reads as empty');
   eq(parsed[1].active, false);
   eq(parsed[1].notes, 'הערה');
   eq(context.validateReminderRow_(parsed[0]).ok, true, 'parsed row validates');

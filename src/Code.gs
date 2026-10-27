@@ -29,7 +29,8 @@ var MAIN_HEADERS = [
   'פעיל',
   'הערות',
   'תאריך לועזי (מחושב)',
-  'התזכורת הבאה (מחושב)'
+  'התזכורת הבאה (מחושב)',
+  'עד (ימים לפני)'
 ];
 
 var LOG_HEADERS = [
@@ -75,6 +76,11 @@ function setup() {
   var main = ensureSheet_(ss, SHEET_MAIN, MAIN_HEADERS);
   var settings = ensureSheet_(ss, SHEET_SETTINGS, ['מפתח', 'ערך', 'הסבר']);
   var log = ensureSheet_(ss, SHEET_LOG, LOG_HEADERS);
+
+  // גיליון קיים מקבל את הכותרות החסרות (למשל אחרי הוספת עמודה) — בלי לגעת בנתונים.
+  ensureHeaders_(main, MAIN_HEADERS);
+  ensureHeaders_(settings, ['מפתח', 'ערך', 'הסבר']);
+  ensureHeaders_(log, LOG_HEADERS);
 
   seedSettings_(settings);
   formatMainSheet_(main);
@@ -280,7 +286,8 @@ function readReminderRows_(sheet) {
       timeRaw: v[8],
       recipientsRaw: String(v[9] || '').trim(),
       active: v[10] === '' || v[10] === null || v[10] === undefined ? true : toBoolean_(v[10]),
-      notes: String(v[11] || '').trim()
+      notes: String(v[11] || '').trim(),
+      untilDays: v[14]
     };
     var hasContent = row.topic || row.day !== '' || row.month !== '';
     if (!hasContent) {
@@ -455,6 +462,31 @@ function ensureSheet_(ss, name, headers) {
   return sheet;
 }
 
+/**
+ * מוסיף כותרות שחסרות בגיליון קיים (למשל אחרי הוספת עמודה בגרסה חדשה).
+ * לא כותב מעל תאים שכבר מולאו — ולכן בטוח להריץ גם בגיליון עם נתונים.
+ */
+function ensureHeaders_(sheet, headers) {
+  var range = sheet.getRange(1, 1, 1, headers.length);
+  var current = range.getValues()[0];
+  var next = [];
+  var changed = false;
+  for (var i = 0; i < headers.length; i++) {
+    var value = current[i];
+    var empty = value === '' || value === null || value === undefined;
+    next.push(empty ? headers[i] : value);
+    if (empty) {
+      changed = true;
+    }
+  }
+  if (!changed) {
+    return;
+  }
+  range.setValues([next]);
+  range.setFontWeight('bold').setBackground('#e8eef7').setVerticalAlignment('middle');
+  sheet.setFrozenRows(1);
+}
+
 function seedSettings_(sheet) {
   var lastRow = sheet.getLastRow();
   var existing = {};
@@ -499,6 +531,7 @@ function formatMainSheet_(sheet) {
   sheet.setColumnWidth(12, 220);
   sheet.setColumnWidth(13, 140);
   sheet.setColumnWidth(14, 220);
+  sheet.setColumnWidth(15, 150);
 
   var maxRows = Math.max(sheet.getMaxRows() - 1, 1);
   var checkbox = SpreadsheetApp.newDataValidation().requireCheckbox().build();
@@ -507,6 +540,7 @@ function formatMainSheet_(sheet) {
     sheet.getRange(flags[i] + '2:' + flags[i] + (maxRows + 1)).setDataValidation(checkbox);
   }
   sheet.getRange('C2:C' + (maxRows + 1)).setNumberFormat('0');
+  sheet.getRange('O2:O' + (maxRows + 1)).setNumberFormat('0');
 }
 
 function formatLogSheet_(sheet) {
